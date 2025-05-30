@@ -1,0 +1,44 @@
+# Core Web and API Framework
+Flask==2.3.3
+
+# NLP, LLM, Speech-to-Text
+openai==1.16.2
+openai-whisper @ git+https://github.com/openai/whisper.git
+langdetect==1.0.9
+
+# Audio and HTTP Utilities
+requests==2.31.0
+tenacity==8.2.3
+
+# Data Validation
+pydantic==1.10.14
+
+# Logging (Rotating logs)
+# (already included in standard library, but for safety)
+python-dotenv==1.0.1
+
+# For audio file manipulation if needed (optional)
+soundfile==0.12.1
+
+twilio>=8.0.0
+
+func-timeout
+
+ffmpeg-python
+
+# ffmpeg needs to be downloaded
+# OpenTTS needs to be downloaded in local
+
+
+# Optional: Use Gunicorn for production (WSGI server)
+# gunicorn==21.2.0
+
+# Redis not required (sessions are in-memory)
+# redis
+
+# Testing (optional for your /tests directory)
+# pytest==8.1.1
+
+# If you want to auto-reload during development
+# (optional, otherwise use Flask's built-in reloader)
+# python-dotenv
