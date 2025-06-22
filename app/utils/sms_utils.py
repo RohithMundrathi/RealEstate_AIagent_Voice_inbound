@@ -26,19 +26,20 @@ def send_sms(virtual_number: str, message: str) -> str:
         logger.error("Twilio credentials are not set")
         raise ValueError("Twilio credentials are missing")
     personal_number = get_personal_number(virtual_number)
-    if not personal_number:
-        logger.error(f"No personal number mapped for virtual number {virtual_number}")
-        raise ValueError(f"No personal number mapped for virtual number {virtual_number}")
-    try:
-        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        sms = client.messages.create(
-            body=message,
-            from_=virtual_number,   # Send FROM the virtual number the user called
-            to=personal_number      # Send TO the personal number mapped in the JSON
-        )
-        logger.info(f"SMS sent to {personal_number} from {virtual_number}: SID {sms.sid}")
-        return sms.sid, sms.personal_number
-    except Exception as e:
-        logger.error(f"Failed to send SMS to {personal_number}: {e}")
-        raise
+    logger.info(f"Sending final collect requirements to {personal_number} and message: {message}")
+    # if not personal_number:
+    #     logger.error(f"No personal number mapped for virtual number {virtual_number}")
+    #     raise ValueError(f"No personal number mapped for virtual number {virtual_number}")
+    # try:
+    #     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    #     sms = client.messages.create(
+    #         body=message,
+    #         from_=virtual_number,   # Send FROM the virtual number the user called
+    #         to=personal_number      # Send TO the personal number mapped in the JSON
+    #     )
+    #     logger.info(f"SMS sent to {personal_number} from {virtual_number}: SID {sms.sid}")
+    #     return sms.sid, sms.personal_number
+    # except Exception as e:
+    #     logger.error(f"Failed to send SMS to {personal_number}: {e}")
+    #     raise
 

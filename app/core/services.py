@@ -1,280 +1,381 @@
-import time
-import os
-from pathlib import Path
 import json
 import time
 import logging
-import shutil
-import assemblyai as aai
-import whisper
-import openai
 import requests
-from openai import OpenAI, APIError
-from func_timeout import func_timeout, FunctionTimedOut
+import concurrent.futures
+import assemblyai as aai
+import openai
+import io
+from deepgram import DeepgramClient, PrerecordedOptions
+import asyncio
 from typing import Dict, Optional
-from langdetect import detect
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from app.config import Config
-from app.core.models import SlotSchema, VoiceMapping, TranscriptionResult
-from app.utils.exceptions import TranscriptionError, SynthesisError, SlotFillingError, APIConnectionError
-from app.utils.audio import temp_audio_file, download_audio
-import tempfile
-from app.utils.audio import download_with_retry
-from pydub import AudioSegment
-from io import BytesIO
+from app.core.models import SlotSchema, TranscriptionResult
+from app.utils.exceptions import TranscriptionError, SlotFillingError, APIConnectionError
 
 logger = logging.getLogger(__name__)
 client = openai.OpenAI(api_key="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") 
-
-_whisper_model = None
 _slot_schema = SlotSchema()
-_voice_mapping = VoiceMapping()
 
-# def foo():
-#     temp_dir = Path(os.path.dirname(__file__))
-#     print("Temp dir:", temp_dir)
-# foo()
-# print("DEBUG: Path is", Path)
-# print(shutil.which("ffmpeg"),shutil.which("ffprobe"))
-# def get_whisper_model():
-#     global _whisper_model
-#     if _whisper_model is None:
-#         logger.info(f"Loading Whisper model: {Config.WHISPER_MODEL_SIZE}")
-#         _whisper_model = whisper.load_model(Config.WHISPER_MODEL_SIZE)
-#     return _whisper_model
+
+# class CloudRunOptimizedService:
+#     ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
+#     ASSEMBLYAI_TRANSCRIBE_URL = "https://api.assemblyai.com/v2/transcript"
+#     ASSEMBLYAI_API_KEY = getattr(Config, "ASSEMBLYAI_API_KEY", None)
+#     if not ASSEMBLYAI_API_KEY:
+#         raise ValueError("ASSEMBLYAI_API_KEY is not set in Config")
+    
+
+#     @staticmethod
+#     def transcribe_audio(audio_url: str, timeout: int = 13) -> TranscriptionResult:
+#         """ Transcribes an audio file from a given URL using AssemblyAI, Cloud Run optimized.Enforces an overall timeout."""
+#         try:
+#             logger.info(f"Starting transcription for {audio_url}")
+#             # Enforce total timeout for all steps
+#             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+#                 future = executor.submit(CloudRunOptimizedService._transcribe_flow, audio_url, timeout)
+#                 return future.result(timeout=timeout)
+#         except concurrent.futures.TimeoutError:
+#             logger.error(f"Transcription timed out after {timeout}s")
+#             raise TranscriptionError(f"Transcription timed out after {timeout} seconds")
+#         except Exception as e:
+#             logger.error(f"Transcription failed: {e}")
+#             raise TranscriptionError(f"Transcription failed: {e}")
+
+#     @staticmethod
+#     def _transcribe_flow(audio_url: str, timeout: int) -> TranscriptionResult:
+#         """Performs the full upload–transcribe–poll flow."""
+#         t0 = time.time()
+#         api_key = CloudRunOptimizedService.ASSEMBLYAI_API_KEY
+#         if not api_key:
+#             raise TranscriptionError("ASSEMBLYAI_API_KEY is not set in environment variables")
+
+#         # Step 1: Download audio (fast, in-memory, with timeout)
+#         logger.info("Downloading audio into memory")
+#         audio_data = CloudRunOptimizedService._download_audio_to_memory(audio_url, api_key)
+
+#         elapsed = time.time() - t0
+#         # Step 2: Upload audio to AssemblyAI (in-memory, fast)
+#         logger.info("Uploading audio to AssemblyAI")
+#         upload_url = CloudRunOptimizedService._upload_audio_data(audio_data, api_key)
+
+#         # Step 3: Request transcription
+#         logger.info("Requesting transcription")
+#         transcript_id = CloudRunOptimizedService._start_transcription(upload_url, api_key)
+
+#         # Step 4: Poll for completion (remaining timeout)
+#         elapsed = time.time() - t0
+#         remaining_timeout = max(timeout - int(elapsed), 4)  # Leave 1–2s buffer
+#         logger.info(f"Polling for transcript (timeout={remaining_timeout}s)")
+#         transcript_result = CloudRunOptimizedService._poll_transcription(
+#             transcript_id, api_key, max_wait=remaining_timeout
+#         )
+
+#         # Step 5: Package result
+#         text = transcript_result.get('text', '')
+#         language = transcript_result.get('language_code', 'en').lower()
+#         confidence = transcript_result.get('confidence', 1.0)
+#         logger.info(f"Transcription success: {text[:40]}...")
+#         return TranscriptionResult(text=text, language=language, confidence=confidence)
+
+#     @staticmethod
+#     def _download_audio_to_memory(audio_url: str, api_key: Optional[str] = None) -> bytes:
+#         """Downloads an audio file into memory, with retries for Twilio 404 timing issues."""
+#         import time
+#         headers = {'User-Agent': 'Mozilla/5.0'}
+#         auth = None
+#         if 'twilio.com' in audio_url:
+#             twilio_sid = getattr(Config, "TWILIO_ACCOUNT_SID", None)
+#             twilio_token = getattr(Config, "TWILIO_AUTH_TOKEN", None)
+#             logger.info(f"Twilio SID: {twilio_sid}, Token length: {len(twilio_token) if twilio_token else 0}")
+#             if twilio_sid and twilio_token:
+#                 auth = (twilio_sid, twilio_token)
+
+#         max_retries = 5
+#         retry_delay = 2  # seconds
+
+#         for attempt in range(1, max_retries + 1):
+#             resp = requests.get(audio_url, timeout=5, headers=headers, auth=auth, stream=True)
+#             if resp.status_code == 200:
+#                 audio_buffer = io.BytesIO()
+#                 for chunk in resp.iter_content(chunk_size=8192):
+#                     if chunk:
+#                         audio_buffer.write(chunk)
+#                 return audio_buffer.getvalue()
+#             elif resp.status_code == 404 and 'twilio.com' in audio_url:
+#                 logger.warning(
+#                     f"Twilio recording not found (404), attempt {attempt}/{max_retries}. "
+#                     f"Retrying in {retry_delay}s..."
+#                 )
+#                 time.sleep(retry_delay)
+#             else:
+#                 resp.raise_for_status()
+
+#         # If all retries failed
+#         logger.error(f"Failed to fetch Twilio recording after {max_retries} retries")
+#         resp.raise_for_status()
+
+
+#     @staticmethod
+#     def _upload_audio_data(audio_data: bytes, api_key: str) -> str:
+#         """Uploads audio to AssemblyAI and returns upload URL."""
+#         headers = {
+#             "authorization": api_key,
+#             "content-type": "application/octet-stream"
+#         }
+#         resp = requests.post(
+#             CloudRunOptimizedService.ASSEMBLYAI_UPLOAD_URL,
+#             headers=headers,
+#             data=audio_data,
+#             timeout=10
+#         )
+#         resp.raise_for_status()
+#         upload_url = resp.json().get("upload_url")
+#         if not upload_url:
+#             raise TranscriptionError("No upload_url returned from AssemblyAI")
+#         return upload_url
+
+#     @staticmethod
+#     def _start_transcription(upload_url: str, api_key: str) -> str:
+#         """Starts transcription and returns transcript ID."""
+#         headers = {
+#             "authorization": api_key,
+#             "content-type": "application/json"
+#         }
+#         payload = {
+#             "audio_url": upload_url,
+#             "language_code": "en",
+#             "punctuate": True,
+#             "format_text": True,
+#             "speech_model": "nano",
+#             "word_boost": ["3bhk", "rent", "bachelors", "family", "east facing",
+#                            "software engineer", "Hitech city"],
+#             "boost_param": "high"
+#         }
+#         resp = requests.post(
+#             CloudRunOptimizedService.ASSEMBLYAI_TRANSCRIBE_URL,
+#             headers=headers,
+#             json=payload,
+#             timeout=5
+#         )
+#         resp.raise_for_status()
+#         transcript_id = resp.json().get("id")
+#         if not transcript_id:
+#             raise TranscriptionError("No transcript ID returned from AssemblyAI")
+#         return transcript_id
+
+#     @staticmethod
+#     def _poll_transcription(transcript_id: str, api_key: str, max_wait: int = 8) -> dict:
+#         """Polls AssemblyAI until transcription is done or times out."""
+#         headers = {"authorization": api_key}
+#         url = f"{CloudRunOptimizedService.ASSEMBLYAI_TRANSCRIBE_URL}/{transcript_id}"
+#         start = time.time()
+#         while time.time() - start < max_wait:
+#             resp = requests.get(url, headers=headers, timeout=5)
+#             resp.raise_for_status()
+#             data = resp.json()
+#             if data.get("status") == "completed":
+#                 return data
+#             if data.get("status") == "error":
+#                 raise TranscriptionError(f"AssemblyAI error: {data.get('error')}")
+#             time.sleep(0.5)
+#         raise TranscriptionError("AssemblyAI transcription polling timed out")
+
+
+
+class CloudRunOptimizedService:
+
+    DEEPGRAM_API_KEY = getattr(Config, "DEEPGRAM_API_KEY", None)
+    if not DEEPGRAM_API_KEY:
+        raise ValueError("DEEPGRAM_API_KEY is not set in Config")
+
+    @staticmethod
+    def transcribe_audio(audio_url: str, timeout: int = 13) -> TranscriptionResult:
+        """Cloud Run optimized transcription flow using Deepgram."""
+
+        try:
+            logger.info(f"Starting transcription for {audio_url}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(CloudRunOptimizedService._transcribe_flow, audio_url, timeout)
+                return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            logger.error(f"Transcription timed out after {timeout}s")
+            raise TranscriptionError(f"Transcription timed out after {timeout} seconds")
+        except Exception as e:
+            logger.error(f"Transcription failed: {e}")
+            raise TranscriptionError(f"Transcription failed: {e}")
+
+    @staticmethod
+    def _transcribe_flow(audio_url: str, timeout: int) -> TranscriptionResult:
+        """Download + Transcribe full flow"""
+
+        t0 = time.time()
+        api_key = CloudRunOptimizedService.DEEPGRAM_API_KEY
+
+        # Step 1: Download audio from Twilio into memory
+        logger.info("Downloading audio into memory")
+        audio_data = CloudRunOptimizedService._download_audio_to_memory(audio_url)
+
+        elapsed = time.time() - t0
+        remaining_timeout = max(timeout - int(elapsed), 4)
+
+        # Step 2: Start transcription with Deepgram async safe
+        logger.info("Uploading to Deepgram for transcription")
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        transcript_result = loop.run_until_complete(
+            CloudRunOptimizedService._deepgram_transcribe(api_key, audio_data)
+        )
+
+        # Step 3: Package result
+        text = transcript_result.get('text', '')
+        language = transcript_result.get('language', 'en')
+        confidence = transcript_result.get('confidence', 1.0)
+        logger.info(f"Transcription success: {text[:40]}...")
+
+        return TranscriptionResult(text=text, language=language, confidence=confidence)
+
+    @staticmethod
+    def _download_audio_to_memory(audio_url: str) -> bytes:
+        """Downloads Twilio recording in-memory with retry."""
+
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        auth = None
+        if 'twilio.com' in audio_url:
+            twilio_sid = getattr(Config, "TWILIO_ACCOUNT_SID", None)
+            twilio_token = getattr(Config, "TWILIO_AUTH_TOKEN", None)
+            logger.info(f"Twilio SID: {twilio_sid}, Token length: {len(twilio_token) if twilio_token else 0}")
+            if twilio_sid and twilio_token:
+                auth = (twilio_sid, twilio_token)
+
+        max_retries = 5
+        retry_delay = 2  # seconds
+
+        for attempt in range(1, max_retries + 1):
+            resp = requests.get(audio_url, timeout=5, headers=headers, auth=auth, stream=True)
+            if resp.status_code == 200:
+                audio_buffer = io.BytesIO()
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        audio_buffer.write(chunk)
+                return audio_buffer.getvalue()
+            elif resp.status_code == 404 and 'twilio.com' in audio_url:
+                logger.warning(
+                    f"Twilio recording not found (404), attempt {attempt}/{max_retries}. "
+                    f"Retrying in {retry_delay}s..."
+                )
+                time.sleep(retry_delay)
+            else:
+                resp.raise_for_status()
+
+        logger.error(f"Failed to fetch Twilio recording after {max_retries} retries")
+        resp.raise_for_status()
+
+    @staticmethod
+    async def _deepgram_transcribe(api_key: str, audio_data: bytes) -> dict:
+        dg_client = DeepgramClient(api_key)
+        source = {"buffer": audio_data}
+        
+        # Define keywords for better detection
+        keywords = [
+            "east facing:3",        # Higher boost for directional terms
+            "facing:4",
+            "software engineer:4",   # High boost for professional terms
+            "Kondapur:3,"
+            "bachelors:4"
+        ]
+        
+        options = PrerecordedOptions(
+            model="nova-2-phonecall",  # Use nova-2-general for better accuracy
+            smart_format=True,
+            punctuate=True,
+            detect_language=True,
+            keywords=keywords,       # Add keywords for better detection
+            profanity_filter=False,  # Disable if interfering with technical terms
+            redact=False,
+            diarize=False,
+            numerals=True,          # Better number detection
+            search=["east", "facing", "software", "engineer"]  # Additional search terms
+        )
+        
+        try:
+            response = dg_client.listen.prerecorded.v("1").transcribe_file(source, options)
+            result = response.results.channels[0].alternatives[0]
+            
+            return {
+                'text': result.transcript,
+                'confidence': result.confidence,
+                'language': getattr(result, 'language', 'en'),
+                'keywords_found': getattr(result, 'keywords', []) 
+            }
+        except Exception as e:
+            logger.exception("Deepgram SDK call failed")
+            raise TranscriptionError(f"Deepgram SDK call failed: {e}")
+
+
+
+
 
 # class TranscriptionService:
-#     _model = None  # Class-level model cache
-
-#     @classmethod
-#     def get_model(cls):
-#         if cls._model is None:
-#             logger.info("Loading Whisper model")
-#             import whisper  # Lazy import
-#             cls._model = whisper.load_model("small")
-#         return cls._model
-
 #     @staticmethod
 #     def transcribe_audio(audio_url: str) -> 'TranscriptionResult':
 #         try:
-#             logger.info(f"Downloading audio from {audio_url}")
-#             audio_data = download_with_retry(
-#                 audio_url,
-#                 max_retries=5,
-#                 initial_delay=2.0,
-#                 backoff_factor=2
+#             timeout = 15
+#             # 1. Set up AssemblyAI API key
+#             api_key = getattr(Config, "ASSEMBLYAI_API_KEY", None)
+#             if not api_key:
+#                 raise ValueError("ASSEMBLYAI_API_KEY is not set in Config")
+            
+#             aai.settings.api_key = api_key
+            
+#             # 2. Create transcriber with configuration
+#             config = aai.TranscriptionConfig(
+#                 language_detection=True,
+#                 punctuate=True,
+#                 format_text=True,
+#                 word_boost = ["3bhk", "rent", "bachelors","family","east facing","software engineer","Hitech city"],
+#                 boost_param = "high",
 #             )
-
-#             if not audio_data or len(audio_data) < 100:
-#                 raise TranscriptionError("Audio file is empty or too short")
-
-#             # Create a persistent temp file path
-#             temp_dir = Path(tempfile.gettempdir())
-#             audio_path = temp_dir / f"whisper_{os.getpid()}_{int(time.time())}.wav"
-
-#             try:
-#                 # Atomic write operation
-#                 with open(audio_path, "wb") as f:
-#                     f.write(audio_data)
-
-#                 # Verify file was written
-#                 if not audio_path.exists() or audio_path.stat().st_size < 100:
-#                     raise TranscriptionError(f"Audio file not properly written (exists={audio_path.exists()}, size={audio_path.stat().st_size if audio_path.exists() else 0})")
-
-#                 # logger.info(f"Audio ready for transcription at {audio_path} (size: {audio_path.stat().st_size} bytes)")
-#                 # logger.info("ffmpeg found: %s", shutil.which("ffmpeg"))
-#                 # logger.info("ffprobe found: %s", shutil.which("ffprobe"))
-
-#                 model = get_whisper_model()
-#                 abs_path = str(audio_path.resolve())
-#                 logger.info(f"Passing absolute path to Whisper: {abs_path}")
-
-#                 try:
-#                     result = func_timeout(
-#                         30,
-#                         model.transcribe,
-#                         args=(abs_path,)
-#                     )
-#                 except FunctionTimedOut:
-#                     raise TranscriptionError("Transcription timeout")
-
-#                 # Process results
-#                 text = result.get("text", "").strip()
-#                 lang = result.get("language", "en").lower()
-
-#                 # Language detection fallback
-#                 mapping = getattr(_voice_mapping, "__dict__", _voice_mapping)
-#                 if not lang or lang not in mapping:
-#                     try:
-#                         lang = detect(text[:500])
-#                         logger.info(f"Detected language: {lang}")
-#                     except Exception as e:
-#                         logger.warning(f"Language detection fallback failed: {e}")
-#                         lang = "en"
-
-#                 logger.info(f"Transcription successful: '{text[:50]}...' (lang: {lang})")
-#                 return TranscriptionResult(
-#                     text=text,
-#                     language=lang,
-#                     confidence=result.get("confidence", 0.0)
-#                 )
-
-#             finally:
-#                 # Clean up the temp file
-#                 try:
-#                     if audio_path.exists():
-#                         audio_path.unlink()
-#                         logger.info(f"Deleted temp file: {audio_path}")
-#                 except Exception as e:
-#                     logger.warning(f"Could not delete temp file: {e}")
-
+            
+#             transcriber = aai.Transcriber(config=config)
+            
+#             # 3. Transcribe directly from URL (if AssemblyAI can access it)
+#             logger.info(f"Starting direct URL transcription of {audio_url}")
+#             transcript = TranscriptionService.transcribe_with_timeout(transcriber, audio_url, timeout)
+        
+#             # 4. Check transcription status
+#             if transcript.status == aai.TranscriptStatus.error:
+#                 raise TranscriptionError(f"Transcription failed: {transcript.error}")
+            
+#             text = transcript.text.strip() if transcript.text else ""
+#             if not text:
+#                 raise TranscriptionError("Transcription returned empty text")
+            
+#             # Get detected language
+#             detected_language = getattr(transcript, 'language_code', 'en')
+#             lang = detected_language.lower() if detected_language else "en"
+            
+#             logger.info(f"Direct URL transcription successful: '{text[:50]}...' (lang: {lang})")
+            
+#             return TranscriptionResult(
+#                 text=text,
+#                 language=lang,
+#                 confidence=getattr(transcript, 'confidence', 1.0)
+#             )
+            
 #         except Exception as e:
-#             logger.error(f"Transcription pipeline failed: {str(e)}", exc_info=True)
-#             raise TranscriptionError(original_error=str(e))
-
-class TranscriptionService:
-    @staticmethod
-    def transcribe_audio(audio_url: str) -> 'TranscriptionResult':
-        try:
-            # 1. Set up AssemblyAI API key
-            api_key = getattr(Config, "ASSEMBLYAI_API_KEY", None)
-            if not api_key:
-                raise ValueError("ASSEMBLYAI_API_KEY is not set in Config")
-            
-            aai.settings.api_key = api_key
-            
-            # 2. Create transcriber with configuration
-            config = aai.TranscriptionConfig(
-                language_detection=True,
-                punctuate=True,
-                format_text=True,
-                word_boost = ["aws", "azure", "google cloud"],
-                boost_param = "high",
-            )
-            
-            transcriber = aai.Transcriber(config=config)
-            
-            # 3. Transcribe directly from URL (if AssemblyAI can access it)
-            logger.info(f"Starting direct URL transcription of {audio_url}")
-            transcript = transcriber.transcribe(audio_url)
-            
-            # 4. Check transcription status
-            if transcript.status == aai.TranscriptStatus.error:
-                raise TranscriptionError(f"Transcription failed: {transcript.error}")
-            
-            text = transcript.text.strip() if transcript.text else ""
-            if not text:
-                raise TranscriptionError("Transcription returned empty text")
-            
-            # Get detected language
-            detected_language = getattr(transcript, 'language_code', 'en')
-            lang = detected_language.lower() if detected_language else "en"
-            
-            logger.info(f"Direct URL transcription successful: '{text[:50]}...' (lang: {lang})")
-            
-            return TranscriptionResult(
-                text=text,
-                language=lang,
-                confidence=getattr(transcript, 'confidence', 1.0)
-            )
-            
-        except Exception as e:
-            logger.error(f"Direct URL transcription failed: {str(e)}")
-            # Fallback to download and upload method
-            logger.info("Falling back to download and upload method")
-            return TranscriptionService.transcribe_audio(audio_url)
-
-
-class SynthesisService:
-    @staticmethod
-    @retry(stop=stop_after_attempt(Config.MAX_RETRIES),
-           wait=wait_exponential(multiplier=1, min=1, max=10),
-           retry=retry_if_exception_type(APIConnectionError))
-    def slow_down_audio(audio_bytes, speed=0.9):
-        audio = AudioSegment.from_file(BytesIO(audio_bytes), format="wav")
-        slowed = audio._spawn(audio.raw_data, overrides={
-            "frame_rate": int(audio.frame_rate * speed)
-        }).set_frame_rate(audio.frame_rate)
-        output = BytesIO()
-        slowed.export(output, format="wav")
-        return output.getvalue()
-
-    @staticmethod
-    def synthesize_speech(text: str, lang_code: str) -> str:
-        try:
-            voice = getattr(_voice_mapping, lang_code, _voice_mapping.en)
-            logger.info(f"Synthesizing speech in {lang_code} using voice {voice}")
-            
-            # Make request to OpenTTS
-            params = {"text": text, "voice": voice, "ssml": "false", "rate": "0.90"}
-            resp = requests.get(Config.OPENTTS_URL, params=params, timeout=Config.REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            
-            # Slow down audio
-            slowed_audio = SynthesisService.slow_down_audio(resp.content, speed=0.9)
-
-            # Create temporary file and save audio
-            with temp_audio_file() as audio_path:
-                with open(audio_path, "wb") as f:
-                    f.write(slowed_audio)
-                
-                # Create persistent file
-                persistent_path = os.path.join(
-                    tempfile.gettempdir(),
-                    f"tts_{int(time.time())}_{os.path.basename(audio_path)}"
-                )
-                
-                # Copy to persistent location
-                with open(audio_path, "rb") as src, open(persistent_path, "wb") as dst:
-                    dst.write(src.read())
-                
-                logger.info(f"Speech synthesized and saved to {persistent_path}")
-
-                # Ensure Twilio compatible encoding
-                try:
-                    audio = AudioSegment.from_file(persistent_path)
-                    
-                    # Check if conversion is needed
-                    if audio.frame_rate != 8000 or audio.channels != 1:
-                        logger.info(f"Converting {persistent_path} to 8kHz mono for Twilio...")
-                        twilio_safe_path = persistent_path.replace(".wav", "_twilio.wav")
-                        audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
-                        audio.export(twilio_safe_path, format="wav")
-                        logger.info(f"Converted and saved Twilio-safe audio: {twilio_safe_path}")
-                        
-                        # Clean up original file if conversion successful
-                        try:
-                            os.remove(persistent_path)
-                            logger.info(f"Removed original file: {persistent_path}")
-                        except Exception as cleanup_err:
-                            logger.warning(f"Could not remove original file {persistent_path}: {cleanup_err}")
-                        
-                        return twilio_safe_path
-                    else:
-                        logger.info(f"Audio already 8kHz mono, no conversion needed: {persistent_path}")
-                        return persistent_path
-                        
-                except Exception as conv_err:
-                    logger.error(f"Failed to convert audio to Twilio format: {conv_err}. Using original file.")
-                    return persistent_path
-                    
-        except requests.RequestException as e:
-            logger.error(f"Speech synthesis request failed: {e}")
-            raise APIConnectionError("OpenTTS", e)
-        except Exception as e:
-            logger.error(f"Speech synthesis failed: {e}", exc_info=True)
-            raise SynthesisError(original_error=e)
-
-
+#             logger.error(f"Direct URL transcription failed: {str(e)}")
+#             logger.info("Falling back to download and upload method")
+#             return TranscriptionService.transcribe_audio(audio_url)
+#     @staticmethod
+#     def transcribe_with_timeout(transcriber, audio_url, timeout):
+#         with concurrent.futures.ThreadPoolExecutor() as executor:
+#             future = executor.submit(transcriber.transcribe, audio_url)
+#             return future.result(timeout=timeout)
 
 class SlotFillingService:
-    @staticmethod
-    def get_prompt(slot_id: str, lang_code: str) -> str:
-        for slot in _slot_schema.slots:
-            if slot.id == slot_id:
-                prompt_dict = slot.prompt.dict()
-                return prompt_dict.get(lang_code, prompt_dict["en"])
-        return ""
     @staticmethod
     def next_missing_slot(filled: Dict[str, str]) -> Optional[str]:
         for slot in _slot_schema.slots:
@@ -292,11 +393,7 @@ class SlotFillingService:
             slot_instructions = []
             for slot in _slot_schema.slots:
                 if slot.id not in filled or not filled[slot.id]:
-                    prompt_dict = slot.prompt.dict()
-                    slot_instructions.append({
-                        "id": slot.id,
-                        "prompt": prompt_dict.get(lang_code, prompt_dict["en"])
-                    })
+                    slot_instructions.append({"id": slot.id})
             if not slot_instructions:
                 return {}
 
@@ -320,7 +417,7 @@ User: buy, semi-furnished, Bangalore, budget 75 lakhs
 Output: {"rent_or_buy":"buy","furnishing":"semi-furnished","location":"Bangalore","budget":"75 lakhs"}
 Example 3:
 User: family, East facing, Whitefield, 3BHK
-Output: {"tenant_type":"family","facing":"East","location":"Whitefield","bhk_type":"3BHK"}
+Output: {"tenant_type":"family","facing":"East facing","location":"Whitefield","bhk_type":"3BHK"}
 Example 4:
 User: bachelors
 Output: {"tenant_type":"bachelors"}
@@ -328,8 +425,8 @@ Example 5:
 User: 20,000 to 25,000
 Output: {"budget":"20000 to 25000"}
 Example 6:
-User: unfurnished 1BHK, HSR Layout
-Output: {"furnishing":"unfurnished","bhk_type":"1BHK","location":"HSR Layout"}
+User: unfurnished 1BHK, HSR Layout, west
+Output: {"furnishing":"unfurnished","bhk_type":"1BHK","location":"HSR Layout","facing":"west facing"}
 Example 7:
 User: Middle floor
 Output: {"floor_pref":"Middle floor"}
@@ -338,8 +435,9 @@ User: Rohith
 Output: {"tenant_name":"Rohith"}"""
 
 
-            prompt_instruction = """You are an expert assistant for a real estate slot-filling bot.Extract only the slots mentioned by the user. If multiple values for a slot are present, output as a comma-separated list in the same JSON key (e.g., "location": "Bangalore, Hyderabad").
-Normalize BHK values to "1BHK", "2BHK", Output only valid slot keys as defined above and new/updated slots only.Omit any slot not mentioned.Respond with **only** a valid JSON object, with no extra text or explanation"""
+            prompt_instruction = """You are an expert assistant for a real estate slot-filling bot.Extract **only** the slots mentioned by the user, from this list: ["tenant_name", "rent_or_buy", "bhk_type", "location", "furnishing", "budget", "tenant_type", "facing", "floor_pref", "profession_details", ...].If multiple values for a slot are present, output them as a comma-separated string in the same JSON key (e.g., "location": "Bangalore, Hyderabad").
+Normalize BHK values to "1BHK", "2BHK", etc.Output **only** valid slot keys (from the list above) and only for new or updated slots. Omit any slot not mentioned.ALWAYS extract the full facing value as heard, e.g., "East facing" or "West facing", not just "East" or "West".
+Do **not** hallucinate keys or values.Respond with **only** a valid JSON object, with no extra text or explanation."""
 
             system_prompt = (
                 prompt_instruction.strip() + "\n\n"
@@ -381,16 +479,6 @@ Normalize BHK values to "1BHK", "2BHK", Output only valid slot keys as defined a
         except Exception as e:
             logger.error(f"Slot filling failed: {e}")
             raise SlotFillingError(original_error=e)
-
-    @staticmethod
-    def confirmation_text(tenant_name: str, lang_code: str) -> str:
-        templates = {
-            "en": f"Thank you! {tenant_name}, your details have been successfully recorded. Goodbye.",  
-            "hi": f"धन्यवाद! {tenant_name} आपका विवरण सफलतापूर्वक सहेज लिया है। अलविदा।",  
-            "te": f"ధన్యవాదాలు! {tenant_name} మీ వివరాలు విజయవంతంగా నమోదు చేయబడ్డాయి. వీడ్కోలు.",  
-            "ta": f"நன்றி! {tenant_name} உங்கள் விவரங்கள் வெற்றிகரமாக பதிவு செய்யப்பட்டுள்ளன. பிரியாவிடை."  
-        }
-        return templates.get(lang_code, templates["en"])
 
     @staticmethod
     def lead_info_text(slots_filled: Dict[str, str]) -> str:

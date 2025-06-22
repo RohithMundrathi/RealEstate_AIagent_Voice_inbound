@@ -238,9 +238,9 @@ class SessionManager:
             return False
 
     @staticmethod
-    def update_interaction(session_data: UserSession) -> UserSession:
+    def update_interaction(redis_key: str, session_data: UserSession) -> UserSession:
         """Safe atomic interaction update with Redis transaction"""
-        redis_key = f"session:{session_data.session_id}"
+        # redis_key = f"session:{session_data.session_id}"
 
         with redis_manager.redis.pipeline() as pipe:
             while True:
@@ -274,49 +274,89 @@ class SessionManager:
                     time.sleep(0.1)
 
 
-class TwiMLGenerator:
-    """Production TwiML generation with validation"""
+class ExomlGenerator:
+    """Production Exoml generation with validation for Exotel Dynamic Webhook Control"""
+    
     @staticmethod
     def _validate_url(url: str) -> bool:
         """Validate audio URL"""
-        return url and url.startswith('https://') or url.startswith('http://') and len(url) < 500
+        return url and (url.startswith('https://') or url.startswith('http://')) and len(url) < 500
 
     @staticmethod
     def create_play_record_response(audio_url: str, record_action_url: str, 
-                                  recording_callback_url: str, max_length: int) -> str:
-        """Generate validated TwiML for play + record"""
+                                  recording_callback_url: str, max_length: int) -> dict:
+        """Generate validated Exoml for play + record"""
         if not all([
-            TwiMLGenerator._validate_url(audio_url),
-            TwiMLGenerator._validate_url(record_action_url),
-            TwiMLGenerator._validate_url(recording_callback_url),
-            1 <= max_length <= 120
+            ExomlGenerator._validate_url(audio_url),
+            ExomlGenerator._validate_url(record_action_url),
+            ExomlGenerator._validate_url(recording_callback_url),
+            1 <= max_length <= 3600  # Exotel supports up to 3600 seconds
         ]):
-            raise ValueError("Invalid TwiML parameters")
+            raise ValueError("Invalid Exoml parameters")
         
-        return f"""<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Play>{audio_url}</Play>
-            <Record maxLength="{max_length}" action="{record_action_url}" 
-                   recordingStatusCallback="{recording_callback_url}" 
-                   playBeep="true" timeout="5" />
-        </Response>"""
+        return {
+            "Exoml": [
+                {
+                    "Play": {
+                        "url": audio_url
+                    }
+                },
+                {
+                    "Record": {
+                        "max_length": max_length,
+                        "finish_on_key": "#",
+                        "play_beep": True,
+                        "timeout": 5,
+                        "action": record_action_url,
+                        "status_callback": recording_callback_url
+                    }
+                }
+            ]
+        }
 
     @staticmethod
-    def create_play_hangup_response(audio_url: str) -> str:
-        """Generate validated TwiML for play + hangup"""
-        if not TwiMLGenerator._validate_url(audio_url):
+    def create_play_hangup_response(audio_url: str) -> dict:
+        """Generate validated Exoml for play + hangup"""
+        if not ExomlGenerator._validate_url(audio_url):
             raise ValueError("Invalid audio URL")
         
-        return f"""<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Play>{audio_url}</Play>
-            <Hangup/>
-        </Response>"""
+        return {
+            "Exoml": [
+                {
+                    "Play": {
+                        "url": audio_url
+                    }
+                },
+                {
+                    "Hangup": {}
+                }
+            ]
+        }
 
     @staticmethod
-    def create_error_response() -> str:
-        """Generate error TwiML response"""
-        return TwiMLGenerator.create_play_hangup_response(ERROR_AUDIO)
+    def create_say_hangup_response(text: str, voice: str = "woman", language: str = "en") -> dict:
+        """Generate Exoml for say + hangup"""
+        return {
+            "Exoml": [
+                {
+                    "Say": {
+                        "text": text,
+                        "voice": voice,
+                        "language": language
+                    }
+                },
+                {
+                    "Hangup": {}
+                }
+            ]
+        }
+
+    @staticmethod
+    def create_error_response() -> dict:
+        """Generate error Exoml response"""
+        return ExomlGenerator.create_say_hangup_response(
+            "Sorry, we encountered an error. Please try again later."
+        )
 
 class AudioUrlBuilder:
     """Production audio URL management with caching and validation"""
@@ -374,7 +414,7 @@ def post_call_cleanup_async(slots_filled: Dict, virtual_number: str, user_mobile
                 f"{summary_text}"
             )
             
-            logger.info(f"Cleanup completed for and sending customer to {user_mobile}, {custom_message}")
+            logger.info(f"Cleanup completed for {user_mobile}")
             
             # SMS sending (implement when ready)
             # try:
@@ -396,7 +436,7 @@ def health_check():
     health_status = {
         "status": "ok",
         "timestamp": time.time(),
-        "version": "2.0-production",
+        "version": "2.0-production-exotel",
         "checks": {}
     }
     
@@ -421,35 +461,29 @@ def health_check():
 def home():
     """Service information endpoint"""
     return jsonify({
-        "service": "Multilingual AI Real Estate Voice Agent",
-        "version": "2.0-production",
+        "service": "Multilingual AI Real Estate Voice Agent - Exotel",
+        "version": "2.0-production-exotel",
         "status": "ready",
-        "features": ["multi-language", "slot-filling", "redis-sessions", "error-recovery"]
+        "features": ["multi-language", "slot-filling", "redis-sessions", "error-recovery", "exotel-integration"]
     })
 
-@voice_agent.route("/answer", methods=["POST","GET"])
-@handle_errors(lambda: Response(TwiMLGenerator.create_error_response(), mimetype="application/xml"))
+@voice_agent.route("/answer", methods=["POST", "GET"])
+@handle_errors(lambda: jsonify(ExomlGenerator.create_error_response()))
 def answer():
+    """Handle incoming call from Exotel"""
     with request_timeout(config.REQUEST_TIMEOUT):
-        # Validate Twilio request
+        # Validate Exotel request parameters
         user_mobile = request.values.get("From", "").strip()
         virtual_number = request.values.get("To", "").strip()
+        call_sid = request.values.get("CallSid", "").strip()
         
-        # if not user_mobile or not virtual_number:
-        #     logger.error("Missing required Twilio parameters")
-        #     raise ValueError("Invalid Twilio request")
+        # Exotel specific parameters
+        exotel_call_id = request.values.get("CallId", "").strip()
+        exotel_app_id = request.values.get("AppId", "").strip()
+        
+        logger.info(f"Incoming call - From: {user_mobile}, To: {virtual_number}, CallSid: {call_sid}, ExotelCallId: {exotel_call_id}")
 
-        # Rate limiting check (basic implementation)
-        # rate_limit_key = f"rate_limit:{user_mobile}"
-        # try:
-        #     current_calls = redis_manager.redis.incr(rate_limit_key)
-        #     redis_manager.redis.expire(rate_limit_key, 300)  # 5 minutes
-        #     if current_calls > 5:  # Max 5 calls per 5 minutes
-        #         logger.warning(f"Rate limit exceeded for {user_mobile}")
-        #         raise ValueError("Rate limit exceeded")
-        # except Exception as e:
-        #     logger.error(f"Rate limiting error: {e}")
-
+        # Rate limiting using token bucket
         limit = 5                 # Max requests
         refill_interval = 300     # 5 minute window
 
@@ -457,11 +491,12 @@ def answer():
             allowed = SessionManager.token_bucket(redis_manager.redis, user_mobile, limit, refill_interval)
             if not allowed:
                 logger.warning(f"Rate limit exceeded for {user_mobile}")
-                raise ValueError("Rate limit exceeded")
+                return jsonify(ExomlGenerator.create_say_hangup_response(
+                    "You have made too many calls recently. Please try again later."
+                ))
         except Exception as e:
             logger.error(f"Rate limiting error: {e}")
-            # Optionally return 429 here if you want
-            return jsonify({"error": "Too Many Requests"}), 429
+            return jsonify(ExomlGenerator.create_error_response()), 429
 
         # Create session
         session_id = str(uuid.uuid4())
@@ -486,174 +521,189 @@ def answer():
         
         record_action_url = f"{base_url}/process-recording?session_id={session_id}"
         recording_status_callback_url = f"{base_url}/recording-status?session_id={session_id}"
-        logger.info(f"{WELCOME_AUDIO},{record_action_url},{recording_status_callback_url},{config.MAX_RECORD_LENGTH}")
+        
+        logger.info(f"URLs - Audio: {WELCOME_AUDIO}, Action: {record_action_url}, Callback: {recording_status_callback_url}")
 
-        # Generate TwiML
-        twiml = TwiMLGenerator.create_play_record_response(
+        # Generate Exoml response
+        exoml_response = ExomlGenerator.create_play_record_response(
             WELCOME_AUDIO, record_action_url, recording_status_callback_url, config.MAX_RECORD_LENGTH
         )
 
         logger.info(f"New session: {session_id} ({user_mobile} -> {virtual_number})")
-        return Response(twiml, mimetype="application/xml")
+        return jsonify(exoml_response)
     
-@voice_agent.route("/process-recording", methods=["POST","GET"])
-@handle_errors(lambda: Response(TwiMLGenerator.create_error_response(), mimetype="application/xml"))   
+@voice_agent.route("/process-recording", methods=["POST", "GET"])
+@handle_errors(lambda: jsonify(ExomlGenerator.create_error_response()))
 def process_recording():
-    session_id = None
-    
     with request_timeout(config.REQUEST_TIMEOUT):
-        # Get and validate session
-        session_id = request.args.get("session_id") or request.form.get("session_id")
-        if not session_id:
-            logger.error("No session ID provided")
-            return Response(status=200)
+        # Exotel parameters
+        user_mobile = request.values.get("From", "").strip()
+        virtual_number = request.values.get("To", "").strip()
+        call_sid = request.values.get("CallSid", "").strip()
+        exotel_call_id = request.values.get("CallId", "").strip()
+        exotel_app_id = request.values.get("AppId", "").strip()
 
-        session_data = SessionManager.get_session(session_id)
-        if not session_data or session_data.end_of_conversation:
-            logger.info(f"Invalid or ended session: {session_id}")
-            return Response(status=200)
+        logger.info(f"Incoming call - From: {user_mobile}, To: {virtual_number}, CallSid: {call_sid}, ExotelCallId: {exotel_call_id}, Exotelappid: {exotel_app_id}")
 
-        # Validate recording URL
-        recording_url = request.values.get("RecordingUrl", "").strip()
-        if not recording_url or not recording_url.startswith('https://'):
-            logger.warning(f"Recording failure for session {session_id}, slot {slot}")
+        # Recording parameters
+        recording_url = (
+            request.values.get("RecordingUrl", "").strip() or
+            request.values.get("recording_url", "").strip() or
+            request.values.get("RecordUrl", "").strip()
+        )
+        recording_duration = request.values.get("RecordingDuration", "0")
+        recording_status = request.values.get("RecordingStatus", "")
 
-            # Push into DLQ queue
-            dlq_payload = {
-                "session_id": session_id,
-                "user_mobile": session_data.user_mobile,
-                "virtual_number": session_data.virtual_number,
-                "slots_filled": session_data.slots_filled,
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "error": "Invalid or missing recording URL",
-                "recording_url": recording_url
-            }
-            redis_manager.redis.lpush(DLQ_KEY, json.dumps(dlq_payload))
+        # DLQ handling if recording missing
+        # if not recording_url or not recording_url.startswith('https://'):
+        #     logger.warning(f"Recording failure for call {exotel_call_id}")
+        #     dlq_payload = {
+        #         "call_id": exotel_call_id,
+        #         "user_mobile": user_mobile,
+        #         "virtual_number": virtual_number,
+        #         "timestamp": datetime.utcnow().isoformat() + "Z",
+        #         "error": "Invalid or missing recording URL",
+        #         "recording_url": recording_url
+        #     }
+        #     redis_manager.redis.lpush(DLQ_KEY, json.dumps(dlq_payload))
+        #     return jsonify(ExomlGenerator.create_say_hangup_response(
+        #         "Sorry, we could not process your response. Please try again."
+        #     ))
 
-            return jsonify({
-                "Exoml": {
-                    "Say": {
-                        "text": "Sorry, we could not get your response. Please try again.",
-                        "voice": "woman",
-                        "language": "en"
-                    },
-                    "Hangup": {}
-                }
-            })
+        logger.info(f"Processing recording: {recording_url}")
 
+        # Create session if not exists (first time)
+        session_key = f"exotel:session:{exotel_call_id}"
 
-        # Update session
-        try:
-            session_data = SessionManager.update_interaction(session_data)
-        except SessionError as e:
-            logger.warning(f"Session limit exceeded for {session_id}: {e}")
-            SessionManager.delete_session(session_id)
-            return Response(TwiMLGenerator.create_play_hangup_response(ERROR_AUDIO), mimetype="application/xml")
-
-        # Process transcription with timeout
-        try:
-            transcription_result = CloudRunOptimizedService.transcribe_audio(recording_url,12)
-            if not transcription_result or not hasattr(transcription_result, 'text'):
-                raise TranscriptionError("Invalid transcription result")
-            
-            session_data.language = getattr(transcription_result, "language", "en")
-            logger.info(f"Session {session_id}: '{transcription_result.text[:100]}' [{session_data.language}]")
-            
-        except Exception as e:
-            logger.error(f"Transcription failed for {session_id}: {e}")
-            raise TranscriptionError(f"Transcription failed: {e}")
-
-        # Process slot filling with validation
-        try:
-            filled_slots = SlotFillingService.extract_slots_with_llm(
-                transcription_result.text,
-                session_data.slots_filled,
-                session_data.language
-            )
-            
-            if not isinstance(filled_slots, dict):
-                raise SlotFillingError("Invalid slot filling result")
-            
-            session_data.slots_filled.update(filled_slots)
-            
-        except Exception as e:
-            logger.error(f"Slot filling failed for {session_id}: {e}")
-            raise SlotFillingError(f"Slot filling failed: {e}")
-
-        # Determine next action
-        next_slot_id = SlotFillingService.next_missing_slot(session_data.slots_filled)
-        base_url = request.url_root.rstrip('/')
-        logger.info(f"Current slots: {session_data.slots_filled}")
-        logger.info(f"Next slot to fill: {next_slot_id}")
-
-        if next_slot_id:
-            # Continue conversation
-            audio_url = AudioUrlBuilder.get_slot_audio_url(next_slot_id, session_data.language)
-            logger.info(f"Sending url to play for the twilio {audio_url}")
-            record_action_url = f"{base_url}/process-recording?session_id={session_id}"
-            recording_callback_url = f"{base_url}/recording-status?session_id={session_id}"
-            
-            twiml = TwiMLGenerator.create_play_record_response(
-                audio_url, record_action_url, recording_callback_url, config.MAX_RECORD_LENGTH
-            )
-            
-            SessionManager.save_session(session_id, session_data)
-            
+        raw_session = redis_manager.redis.get(session_key)
+        if raw_session:
+            session_data = UserSession.model_validate(json.loads(raw_session))
         else:
-            # End conversation
-            audio_url = AudioUrlBuilder.get_confirmation_audio_url(session_data.language)
-            twiml = TwiMLGenerator.create_play_hangup_response(audio_url)
-            
-            logger.info(f"Call completed for {session_id}: {len(session_data.slots_filled)} slots filled")
-            
-            # Async cleanup
-            threading.Thread(
-                target=post_call_cleanup_async,
-                args=(session_data.slots_filled, session_data.virtual_number, 
-                      session_data.user_mobile, session_data.language),
-                daemon=True
-            ).start()
-            
-            SessionManager.delete_session(session_id)
+            logger.info(f"Creating new session in else block")
+            session_id = str(uuid.uuid4())
+            session_data = UserSession(
+                session_id=session_id,
+                user_mobile=user_mobile,
+                virtual_number=virtual_number,
+                interaction_count=0,
+                last_interaction_time=time.time(),
+                slots_filled={},
+                language='en',
+                end_of_conversation=False,
+            )
+            redis_manager.redis.set(session_key, json.dumps(session_data.model_dump()), ex=config.SESSION_TIMEOUT)
+            logger.info(f"Session created for call_id: {exotel_call_id}")
+            return make_response('', 200)
 
-        return Response(twiml, mimetype="application/xml")
+        # # Update interaction count safely
+        # try:
+        #     session_data = SessionManager.update_interaction(session_key, session_data)
+        # except SessionError as e:
+        #     logger.warning(f"Session limit exceeded: {e}")
+        #     redis_manager.redis.delete(session_key)
+        #     return jsonify(ExomlGenerator.create_say_hangup_response(
+        #         "Session limit exceeded. Please try again later."
+        #     ))
+
+
+        # # Transcription
+        # try:
+        #     transcription_result = CloudRunOptimizedService.transcribe_audio(recording_url, 12)
+        #     if not transcription_result or not hasattr(transcription_result, 'text'):
+        #         raise TranscriptionError("Invalid transcription result")
+
+        #     session_data.language = getattr(transcription_result, "language", "en")
+        #     logger.info(f"Transcript: {transcription_result.text[:100]}")
+        # except Exception as e:
+        #     logger.error(f"Transcription failed: {e}")
+        #     return jsonify(ExomlGenerator.create_say_hangup_response(
+        #         "Sorry, transcription failed."
+        #     ))
+
+        # # Slot Filling
+        # try:
+        #     filled_slots = SlotFillingService.extract_slots_with_llm(
+        #         transcription_result.text,
+        #         session_data.slots_filled,
+        #         session_data.language
+        #     )
+        #     session_data.slots_filled.update(filled_slots)
+        # except Exception as e:
+        #     logger.error(f"Slot filling failed: {e}")
+        #     return jsonify(ExomlGenerator.create_say_hangup_response(
+        #         "Sorry, we encountered an error processing your response."
+        #     ))
+
+        # # Determine next slot
+        # next_slot_id = SlotFillingService.next_missing_slot(session_data.slots_filled)
+        # logger.info(f"Next slot: {next_slot_id}")
+
+        # base_url = request.url_root.rstrip('/')
+        # recording_callback_url = f"{base_url}/process-recording"
+
+        # # Conversation logic
+        # if next_slot_id:
+        #     audio_url = AudioUrlBuilder.get_slot_audio_url(next_slot_id, session_data.language)
+        #     exoml_response = ExomlGenerator.create_play_record_response(
+        #         audio_url, recording_callback_url, None, config.MAX_RECORD_LENGTH
+        #     )
+        #     # Save updated session state
+        #     redis_manager.redis.set(session_key, json.dumps(session_data.model_dump()), ex=config.SESSION_TIMEOUT)
+
+        # else:
+        #     audio_url = AudioUrlBuilder.get_confirmation_audio_url(session_data.language)
+        #     exoml_response = ExomlGenerator.create_play_hangup_response(audio_url)
+        #     logger.info(f"Call completed for session: {session_data.session_id}")
+        #     redis_manager.redis.delete(session_key)
+
+        # return jsonify(exoml_response)
+
     
 @voice_agent.route("/dlq", methods=["GET"])
 def dlq_inspect():
+    """Inspect dead letter queue for failed recordings"""
     try:
         dlq_items = redis_manager.redis.lrange(DLQ_KEY, 0, 50)
         parsed = [json.loads(item) for item in dlq_items]
-        return jsonify(parsed), 200
+        return jsonify({
+            "total_items": len(parsed),
+            "items": parsed
+        }), 200
     except Exception as e:
         logger.error(f"DLQ inspect failed: {e}")
         return jsonify({"error": "internal error"}), 500
 
-    
 @voice_agent.route("/recording-status", methods=["POST"])
 @handle_errors()
 def recording_status():
+    """Handle recording status callbacks from Exotel"""
     try:
-        recording_url = request.values.get("RecordingUrl", "").strip()
+        # Exotel recording status parameters
+        recording_url = (
+            request.values.get("RecordingUrl", "").strip() or
+            request.values.get("recording_url", "").strip()
+        )
         session_id = request.values.get("session_id")
-        slot = request.values.get("slot", "unknown")
+        recording_status = request.values.get("RecordingStatus", "")
+        recording_duration = request.values.get("RecordingDuration", "0")
+        call_sid = request.values.get("CallSid", "")
+        
+        logger.info(f"Recording status callback - Session: {session_id}, Status: {recording_status}, Duration: {recording_duration}s, URL: {recording_url}")
 
-        if not recording_url or not recording_url.startswith('https://'):
-            logger.info(f"Invalid recording URL for session {session_id}, slot {slot}")
-            # Set session flag to prevent retry
-            redis_manager.redis.hset(session_id, f"{slot}_failed", 1)
-            # Respond with TwiML to say error and hang up or prompt for retry
-            return make_response("""
-                <Response>
-                    <Say>Sorry, we could not get your response. Please try again.</Say>
-                    <Hangup/>
-                </Response>
-            """, 200, {'Content-Type': 'application/xml'})
+        if recording_status == "failed" or not recording_url:
+            logger.warning(f"Recording failed for session {session_id}")
+            # Could implement retry logic here if needed
+            return jsonify({"status": "received", "action": "none"})
 
-        logger.info(f"Recording status {session_id}: {status}")
-        return "OK", 200
+        # Log successful recording
+        if recording_status == "completed":
+            logger.info(f"Recording completed successfully for session {session_id}")
+
+        return jsonify({"status": "received"})
+        
     except Exception as e:
         logger.error(f"Recording status error: {e}")
-        return "", 500
+        return jsonify({"error": "internal error"}), 500
 
 # Graceful shutdown handler
 def shutdown_handler(signum, frame):

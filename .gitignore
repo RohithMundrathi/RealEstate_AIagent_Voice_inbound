@@ -2,3 +2,4 @@
 app.log
 *.pyc
 number_map.json
+myenv

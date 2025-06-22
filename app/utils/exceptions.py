@@ -31,3 +31,10 @@ class SlotFillingError(BaseAppException):
         if original_error:
             message += f": {str(original_error)}"
         super().__init__(message, status_code=500)
+
+class SessionError(BaseAppException): 
+    def __init__(self, original_error=None):
+        message = "Failed to handle session operation"
+        if original_error:
+            message += f": {str(original_error)}"
+        super().__init__(message, status_code=500)
