@@ -15,7 +15,7 @@ from app.core.models import SlotSchema, TranscriptionResult
 from app.utils.exceptions import TranscriptionError, SlotFillingError, APIConnectionError
 
 logger = logging.getLogger(__name__)
-client = openai.OpenAI(api_key="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") 
+client = openai.OpenAI(api_key="sk-proj-") 
 _slot_schema = SlotSchema()
 
 
